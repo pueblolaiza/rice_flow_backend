@@ -259,3 +259,137 @@ def predict_yield(features: dict) -> dict:
         'model_used':           active.get_model_type_display(),
         'r2_score':             active.r2_score,
     }
+
+
+#from codex
+
+
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Mapping, Optional, Union
+
+Number = Union[int, float, Decimal, str]
+
+
+@dataclass(frozen=True)
+class VarietyBaseline:
+    """Baseline yield and rainfall conditions for a seeded rice variety."""
+
+    yield_tons_per_hectare: Decimal
+    ideal_rainfall_index: Decimal = Decimal("1.00")
+    rainfall_tolerance: Decimal = Decimal("0.35")
+
+
+# Add only seeded/active rice varieties here.
+# Keys may be your database variety IDs (e.g., 1, 2) or codes/names.
+VARIETY_BASELINES: Mapping[Union[int, str], VarietyBaseline] = {
+    "NSIC Rc 222": VarietyBaseline(Decimal("5.20")),
+    "NSIC Rc 480": VarietyBaseline(Decimal("4.80")),
+    "PSB Rc 18": VarietyBaseline(Decimal("4.30")),
+}
+
+
+def estimate_yield(
+    target_variety_id: Union[int, str, None],
+    farm_soil_area_hectares: Number,
+    seasonal_rainfall_index: Number,
+    *,
+    variety_baselines: Optional[
+        Mapping[Union[int, str], VarietyBaseline]
+    ] = None,
+) -> dict:
+    """
+    Calculate a read-only rice harvest estimate.
+
+    seasonal_rainfall_index:
+        1.00 = normal/ideal seasonal rainfall.
+        Values outside the variety tolerance reduce the predicted yield.
+    """
+    baselines = variety_baselines or VARIETY_BASELINES
+    baseline = baselines.get(target_variety_id)
+
+    try:
+        area = Decimal(str(farm_soil_area_hectares))
+        rainfall = Decimal(str(seasonal_rainfall_index))
+    except (InvalidOperation, TypeError, ValueError):
+        return _unavailable("invalid_parameters")
+
+    # Ignore unknown, empty, or unseeded varieties.
+    if baseline is None or baseline.yield_tons_per_hectare <= 0:
+        return _unavailable("variety_not_seeded")
+
+    if not area.is_finite() or not rainfall.is_finite():
+        return _unavailable("invalid_parameters")
+
+    if area <= 0 or rainfall < 0:
+        return _unavailable("invalid_parameters")
+
+    deviation = abs(rainfall - baseline.ideal_rainfall_index)
+    excess_deviation = max(
+        Decimal("0"),
+        deviation - baseline.rainfall_tolerance,
+    )
+
+    # Limits the impact of abnormal rainfall to avoid zero/negative estimates.
+    rainfall_factor = max(
+        Decimal("0.40"),
+        Decimal("1.00") - excess_deviation,
+    )
+
+    estimated_yield_per_hectare = (
+        baseline.yield_tons_per_hectare * rainfall_factor
+    )
+    estimated_crop_tons = estimated_yield_per_hectare * area
+
+    confidence_score = max(
+        Decimal("0.50"),
+        Decimal("0.90")
+        - min(Decimal("0.45"), deviation * Decimal("0.35")),
+    )
+
+    expected_harvest_status = (
+        "on_track"
+        if rainfall_factor >= Decimal("0.90")
+        else "weather_risk"
+    )
+
+    return {
+        "estimated_crop_tons": _format(estimated_crop_tons),
+        "estimated_yield_tons_per_hectare": _format(
+            estimated_yield_per_hectare
+        ),
+        "expected_harvest_status": expected_harvest_status,
+        "harvest_status_flags": {
+            "is_estimate_available": True,
+            "rainfall_within_comfort_range": (
+                deviation <= baseline.rainfall_tolerance
+            ),
+            "requires_weather_review": (
+                expected_harvest_status == "weather_risk"
+            ),
+        },
+        "confidence_score": _format(confidence_score),
+        "confidence_percent": int(
+            (confidence_score * 100).quantize(Decimal("1"))
+        ),
+    }
+
+
+def _unavailable(reason: str) -> dict:
+    return {
+        "estimated_crop_tons": None,
+        "estimated_yield_tons_per_hectare": None,
+        "expected_harvest_status": "unavailable",
+        "harvest_status_flags": {
+            "is_estimate_available": False,
+            "rainfall_within_comfort_range": False,
+            "requires_weather_review": False,
+        },
+        "confidence_score": "0.00",
+        "confidence_percent": 0,
+        "reason": reason,
+    }
+
+
+def _format(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
